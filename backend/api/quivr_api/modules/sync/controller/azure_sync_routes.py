@@ -4,9 +4,14 @@ import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from msal import ConfidentialClientApplication
+
 from quivr_api.logger import get_logger
 from quivr_api.middlewares.auth import AuthBearer, get_current_user
-from quivr_api.modules.sync.dto.inputs import SyncsUserInput, SyncUserUpdateInput
+from quivr_api.modules.sync.dto.inputs import (
+    SyncsUserInput,
+    SyncsUserStatus,
+    SyncUserUpdateInput,
+)
 from quivr_api.modules.sync.service.sync_service import SyncService, SyncUserService
 from quivr_api.modules.user.entity.user_identity import UserIdentity
 
@@ -69,6 +74,7 @@ def authorize_azure(
         credentials={},
         state={"state": state},
         additional_data={"flow": flow},
+        status=str(SyncsUserStatus.SYNCING),
     )
     sync_user_service.create_sync_user(sync_user_input)
     return {"authorization_url": flow["auth_uri"]}
@@ -99,15 +105,18 @@ def oauth2callback_azure(request: Request):
     sync_user_state = sync_user_service.get_sync_user_by_state(state_dict)
     logger.info(f"Retrieved sync user state: {sync_user_state}")
 
-    if state_dict != sync_user_state["state"]:
+    if not sync_user_state or state_dict != sync_user_state.state:
         logger.error("Invalid state parameter")
         raise HTTPException(status_code=400, detail="Invalid state parameter")
-    if sync_user_state.get("user_id") != current_user:
+    if str(sync_user_state.user_id) != current_user:
+        logger.info(f"Sync user state: {sync_user_state}")
+        logger.info(f"Current user: {current_user}")
+        logger.info(f"Sync user state user_id: {sync_user_state.user_id}")
         logger.error("Invalid user")
         raise HTTPException(status_code=400, detail="Invalid user")
 
     result = client.acquire_token_by_auth_code_flow(
-        sync_user_state["additional_data"]["flow"], dict(request.query_params)
+        sync_user_state.additional_data["flow"], dict(request.query_params)
     )
     if "access_token" not in result:
         logger.error(f"Failed to acquire token: {result}")
@@ -134,7 +143,9 @@ def oauth2callback_azure(request: Request):
     logger.info(f"Retrieved email for user: {current_user} - {user_email}")
 
     sync_user_input = SyncUserUpdateInput(
-        credentials=result, state={}, email=user_email
+        credentials=result,
+        email=user_email,
+        status=str(SyncsUserStatus.SYNCED),
     )
 
     sync_user_service.update_sync_user(current_user, state_dict, sync_user_input)

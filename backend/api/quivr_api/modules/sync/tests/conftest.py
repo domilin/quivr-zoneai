@@ -1,6 +1,6 @@
-import asyncio
 import json
 import os
+import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -10,14 +10,11 @@ from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-import sqlalchemy
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import Session, create_engine, select
-from sqlmodel.ext.asyncio.session import AsyncSession
+from dotenv import load_dotenv
+from sqlmodel import select, text
 
 from quivr_api.modules.brain.entity.brain_entity import Brain, BrainType
 from quivr_api.modules.brain.repository.brains_vectors import BrainsVectors
-from quivr_api.modules.dependencies import get_supabase_client
 from quivr_api.modules.knowledge.repository.knowledges import KnowledgeRepository
 from quivr_api.modules.knowledge.service.knowledge_service import KnowledgeService
 from quivr_api.modules.notification.dto.inputs import (
@@ -56,6 +53,7 @@ from quivr_api.modules.sync.entity.notion_page import (
 )
 from quivr_api.modules.sync.entity.sync_models import (
     DBSyncFile,
+    NotionSyncFile,
     SyncFile,
     SyncsActive,
     SyncsUser,
@@ -65,6 +63,7 @@ from quivr_api.modules.sync.service.sync_notion import SyncNotionService
 from quivr_api.modules.sync.service.sync_service import (
     ISyncService,
     ISyncUserService,
+    SyncUserService,
 )
 from quivr_api.modules.sync.utils.sync import (
     BaseSync,
@@ -75,6 +74,7 @@ from quivr_api.modules.sync.utils.syncutils import (
 from quivr_api.modules.user.entity.user_identity import User
 
 pg_database_base_url = "postgres:postgres@localhost:54322/postgres"
+load_dotenv()
 
 
 @pytest.fixture(scope="function")
@@ -181,46 +181,6 @@ def fetch_response():
     ]
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest_asyncio.fixture(scope="session")
-async def sync_engine():
-    engine = create_engine(
-        "postgresql://" + pg_database_base_url,
-        echo=True if os.getenv("ORM_DEBUG") else False,
-        pool_pre_ping=True,
-        pool_size=10,
-        pool_recycle=0.1,
-    )
-
-    yield engine
-
-
-@pytest_asyncio.fixture()
-async def sync_session(sync_engine):
-    with sync_engine.connect() as conn:
-        conn.begin()
-        conn.begin_nested()
-        sync_session = Session(conn, expire_on_commit=False)
-
-        @sqlalchemy.event.listens_for(sync_session, "after_transaction_end")
-        def end_savepoint(session, transaction):
-            if conn.closed:
-                return
-            if not conn.in_nested_transaction():
-                conn.sync_connection.begin_nested()
-
-        yield sync_session
-
-
 @pytest.fixture
 def search_result():
     return [
@@ -273,39 +233,7 @@ def search_result():
     ]
 
 
-@pytest_asyncio.fixture(scope="session")
-async def async_engine():
-    engine = create_async_engine(
-        "postgresql+asyncpg://" + pg_database_base_url,
-        echo=True if os.getenv("ORM_DEBUG") else False,
-        future=True,
-        pool_pre_ping=True,
-        pool_size=10,
-        pool_recycle=0.1,
-    )
-    yield engine
-
-
-@pytest_asyncio.fixture()
-async def session(async_engine):
-    async with async_engine.connect() as conn:
-        await conn.begin()
-        await conn.begin_nested()
-        async_session = AsyncSession(conn, expire_on_commit=False)
-
-        @sqlalchemy.event.listens_for(
-            async_session.sync_session, "after_transaction_end"
-        )
-        def end_savepoint(session, transaction):
-            if conn.closed:
-                return
-            if not conn.in_nested_transaction():
-                conn.sync_connection.begin_nested()
-
-        yield async_session
-
-
-@pytest.fixture
+@pytest.fixture(scope="function")
 def user_1(sync_session) -> User:
     user_1 = (
         sync_session.exec(select(User).where(User.email == "admin@quivr.app"))
@@ -437,7 +365,11 @@ class MockSyncCloud(BaseSync):
         ]
 
     async def aget_files(
-        self, credentials: Dict, folder_id: str | None = None, recursive: bool = False
+        self,
+        credentials: Dict,
+        sync_user_id=int,
+        folder_id: str | None = None,
+        recursive: bool = False,
     ) -> List[SyncFile]:
         n_files = 1
         return [
@@ -683,7 +615,7 @@ def sync_file():
         name="test_file.txt",
         is_folder=False,
         last_modified=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        mime_type="txt",
+        mime_type=".txt",
         web_view_link="",
         notification_id=uuid4(),  #
     )
@@ -706,7 +638,7 @@ def prev_file():
     return file
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function")
 async def brain_user_setup(
     session,
 ) -> Tuple[Brain, User]:
@@ -728,7 +660,63 @@ async def brain_user_setup(
     return brain_1, user_1
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function")
+async def sync_user_notion_setup(
+    session,
+):
+    sync_user_service = SyncUserService()
+    user_1 = (
+        await session.exec(select(User).where(User.email == "admin@quivr.app"))
+    ).one()
+
+    # Sync User
+    sync_user_input = SyncsUserInput(
+        user_id=str(user_1.id),
+        name="sync_user_1",
+        provider="notion",
+        credentials={},
+        state={},
+        additional_data={},
+        status="",
+    )
+    sync_user = SyncsUser.model_validate(
+        sync_user_service.create_sync_user(sync_user_input)
+    )
+    assert sync_user.id
+
+    # Notion pages
+    notion_page_1 = NotionSyncFile(
+        notion_id=uuid.uuid4(),
+        sync_user_id=sync_user.id,
+        user_id=sync_user.user_id,
+        name="test",
+        last_modified=datetime.now() - timedelta(hours=5),
+        mime_type="txt",
+        web_view_link="",
+        icon="",
+        is_folder=False,
+    )
+
+    notion_page_2 = NotionSyncFile(
+        notion_id=uuid.uuid4(),
+        sync_user_id=sync_user.id,
+        user_id=sync_user.user_id,
+        name="test_2",
+        last_modified=datetime.now() - timedelta(hours=5),
+        mime_type="txt",
+        web_view_link="",
+        icon="",
+        is_folder=False,
+    )
+    session.add(notion_page_1)
+    session.add(notion_page_2)
+    yield sync_user
+    await session.execute(
+        text("DELETE FROM syncs_user WHERE id = :sync_id"), {"sync_id": sync_user.id}
+    )
+
+
+@pytest_asyncio.fixture(scope="function")
 async def setup_syncs_data(
     brain_user_setup,
 ) -> Tuple[SyncsUser, SyncsActive]:
@@ -742,6 +730,7 @@ async def setup_syncs_data(
         credentials={},
         state={},
         additional_data={},
+        status="",
     )
     sync_active = SyncsActive(
         id=0,
@@ -826,8 +815,3 @@ def syncutils_notion(
     )
 
     return sync_util
-
-
-@pytest.fixture(scope="session")
-def supabase_client():
-    return get_supabase_client()

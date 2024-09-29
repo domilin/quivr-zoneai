@@ -1,18 +1,19 @@
 import os
 from typing import AsyncGenerator, Callable, Generator, Generic, Optional, Type, TypeVar
+from urllib.parse import urlparse
 
 from fastapi import Depends
 from langchain.embeddings.base import Embeddings
 from langchain_community.embeddings.ollama import OllamaEmbeddings
 
 # from langchain_community.vectorstores.supabase import SupabaseVectorStore
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import AzureOpenAIEmbeddings, OpenAIEmbeddings
 
-# from quivr_api.vector.service.vector_service import VectorService
-# from quivr_api.vectorstore.supabase import CustomSupabaseVectorStore
+# from quivr_api.modules.vector.service.vector_service import VectorService
+# from quivr_api.modules.vectorstore.supabase import CustomSupabaseVectorStore
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
-from sqlmodel import Session
+from sqlmodel import Session, text
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from quivr_api.logger import get_logger
@@ -77,16 +78,17 @@ async_engine = create_async_engine(
 
 def get_sync_session() -> Generator[Session, None, None]:
     with Session(sync_engine, expire_on_commit=False, autoflush=False) as session:
-        yield session
-
-
-# def get_documents_vector_store(vector_service: VectorService) -> SupabaseVectorStore:
-#     embeddings = get_embedding_client()
-#     supabase_client: Client = get_supabase_client()
-#     documents_vector_store = CustomSupabaseVectorStore(  # Modified by @chloe Check
-#         supabase_client, embeddings, table_name="vectors", vector_service=vector_service
-#     )
-#     return documents_vector_store
+        try:
+            session.execute(
+                text("SET SESSION idle_in_transaction_session_timeout = '5min';")
+            )
+            yield session
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
@@ -94,6 +96,9 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
         async_engine,
     ) as session:
         try:
+            await session.execute(
+                text("SET SESSION idle_in_transaction_session_timeout = '5min';")
+            )
             yield session
             await session.commit()
         except Exception as e:
@@ -121,6 +126,20 @@ def get_embedding_client() -> Embeddings:
         embeddings = OllamaEmbeddings(
             base_url=settings.ollama_api_base_url,
         )  # pyright: ignore reportPrivateUsage=none
+    elif settings.azure_openai_embeddings_url:
+        # https://quivr-test.openai.azure.com/openai/deployments/embedding/embeddings?api-version=2023-05-15
+        # parse the url to get the deployment name
+        deployment = settings.azure_openai_embeddings_url.split("/")[5]
+        netloc = "https://" + urlparse(settings.azure_openai_embeddings_url).netloc
+        api_version = settings.azure_openai_embeddings_url.split("=")[1]
+        logger.debug(f"Using Azure OpenAI embeddings: {deployment}")
+        logger.debug(f"Using Azure OpenAI embeddings: {netloc}")
+        logger.debug(f"Using Azure OpenAI embeddings: {api_version}")
+        embeddings = AzureOpenAIEmbeddings(
+            azure_deployment=deployment,
+            azure_endpoint=netloc,
+            api_version=api_version,
+        )
     else:
         embeddings = OpenAIEmbeddings()  # pyright: ignore reportPrivateUsage=none
     return embeddings
