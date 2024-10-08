@@ -2,11 +2,15 @@ import asyncio
 import os
 from uuid import UUID
 
+import structlog
+import torch
+from celery import signals
 from celery.schedules import crontab
 from celery.signals import worker_process_init
+from celery.utils.log import get_task_logger
 from dotenv import load_dotenv
 from quivr_api.celery_config import celery
-from quivr_api.logger import get_logger
+from quivr_api.logger import setup_logger
 from quivr_api.models.settings import settings
 from quivr_api.modules.assistant.repository.tasks import TasksRepository
 from quivr_api.modules.assistant.services.tasks_service import TasksService
@@ -32,8 +36,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlmodel import Session, text
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from quivr_worker.celery_monitor import is_being_executed
 from quivr_worker.assistants.assistants import process_assistant
+from quivr_worker.celery_monitor import is_being_executed
 from quivr_worker.check_premium import check_is_premium
 from quivr_worker.process.process_s3_file import process_uploaded_file
 from quivr_worker.process.process_url import process_url_func
@@ -46,10 +50,13 @@ from quivr_worker.syncs.process_active_syncs import (
 from quivr_worker.syncs.store_notion import fetch_and_store_notion_files_async
 from quivr_worker.utils.utils import _patch_json
 
+torch.set_num_threads(1)
+
+setup_logger("worker.log", send_log_server=False)
 load_dotenv()
 
-get_logger("quivr_core")
-logger = get_logger("celery_worker")
+logger = structlog.wrap_logger(get_task_logger(__name__))
+
 _patch_json()
 
 
@@ -67,6 +74,13 @@ storage = SupabaseS3Storage()
 notion_service: SyncNotionService | None = None
 async_engine: AsyncEngine | None = None
 engine: Engine | None = None
+
+
+@signals.task_prerun.connect
+def on_task_prerun(sender, task_id, task, args, kwargs, **_):
+    structlog.contextvars.bind_contextvars(task_id=task_id, task_name=task.name)
+    if vars := kwargs.get("contextvars", None):
+        structlog.contextvars.bind_contextvars(**vars)
 
 
 @worker_process_init.connect
@@ -111,7 +125,6 @@ def process_assistant_task(
     logger.info(
         f"process_assistant_task started for assistant_id={assistant_id}, notification_uuid={notification_uuid}, task_id={task_id}"
     )
-    print("process_assistant_task")
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(
@@ -130,6 +143,8 @@ async def aprocess_assistant_task(
     task_id: int,
     user_id: str,
 ):
+    global async_engine
+    assert async_engine
     async with AsyncSession(async_engine) as async_session:
         try:
             await async_session.execute(
